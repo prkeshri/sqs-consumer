@@ -48,6 +48,8 @@ function isAuthenticationError(err) {
  * @param {object} options.sqs
  * @param {number} options.visibilityTimeout
  * @param {number} options.waitTimeSeconds
+ * @param {number} options.minMessasgeProcessings
+ * @param {number} options.maxMessasgeProcessings
  */
 function Consumer(options) {
   validate(options);
@@ -69,6 +71,11 @@ function Consumer(options) {
 
   this._handleSqsResponseBound = this._handleSqsResponse.bind(this);
   this._processMessageBound = this._processMessage.bind(this);
+
+  this.messagesInProcessing = 0;
+  this.polling = false;
+  this.minMessasgeProcessings = options.minMessasgeProcessings || 1;
+  this.maxMessasgeProcessings = options.maxMessasgeProcessings || (this.batchSize + this.minMessasgeProcessings - 1);
 }
 
 util.inherits(Consumer, EventEmitter);
@@ -100,11 +107,29 @@ Consumer.prototype.stop = function () {
 };
 
 Consumer.prototype._poll = function () {
+  // Check if we are already polling
+  if(this.polling) {
+    return;
+  }
+
+  // Check if there are messagesInProcessing
+  if(this.minMessasgeProcessings && this.messagesInProcessing >= this.minMessasgeProcessings) {
+      // Already too many messages are in processing!!
+      return;
+  }
+
+  this.polling = true;
+
+  var batchSize = this.batchSize;
+  if(batchSize + this.messagesInProcessing > this.maxMessasgeProcessings) {
+    batchSize = this.maxMessasgeProcessings - this.messagesInProcessing;
+  }
+
   var receiveParams = {
     QueueUrl: this.queueUrl,
     AttributeNames: this.attributeNames,
     MessageAttributeNames: this.messageAttributeNames,
-    MaxNumberOfMessages: this.batchSize,
+    MaxNumberOfMessages: batchSize,
     WaitTimeSeconds: this.waitTimeSeconds,
     VisibilityTimeout: this.visibilityTimeout
   };
@@ -120,6 +145,7 @@ Consumer.prototype._poll = function () {
 Consumer.prototype._handleSqsResponse = function (err, response) {
   var consumer = this;
 
+  this.polling = false;
   if (err) {
     this.emit('error', new SQSError('SQS receive message failed: ' + err.message));
   }
@@ -128,10 +154,16 @@ Consumer.prototype._handleSqsResponse = function (err, response) {
   debug(response);
 
   if (response && response.Messages && response.Messages.length > 0) {
-    async.each(response.Messages, this._processMessageBound, function () {
-      // start polling again once all of the messages have been processed
-      consumer._poll();
-    });
+    this.messagesInProcessing = response.Messages.length;
+    async.each(response.Messages, function(message, next) {
+      consumer._processMessage(message, function() {
+        consumer.messagesInProcessing--;
+        consumer._poll();
+        next();
+      });
+    }, function() {});
+    consumer._poll();
+
   } else if (response && !response.Messages) {
     this.emit('empty');
     this._poll();
